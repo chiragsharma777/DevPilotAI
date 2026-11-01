@@ -28,15 +28,16 @@ const API_BASE_URL = (
   import.meta.env.VITE_API_URL || ""
 ).replace(/\/+$/, "");
 
-const storageKeysForUser = (userId: string) => {
-  const prefix = `devpilot:${userId}`;
+const storageKeysForWorkspace = () => {
+  const prefix = "devpilot:workspace";
   return {
-    activePage: `${prefix}:active-page`,
     conversations: `${prefix}:conversations`,
     activeConversation: `${prefix}:active-conversation`,
     displayName: `${prefix}:display-name`,
   };
 };
+
+const WORKSPACE_STORAGE = storageKeysForWorkspace();
 
 type PageId =
   | "overview"
@@ -124,12 +125,6 @@ type ApiResult<T> = {
   status: number;
   data: T | null;
   error?: string;
-};
-
-type AuthUser = {
-  id?: string;
-  email?: string;
-  user_metadata?: { display_name?: string };
 };
 
 const NAVIGATION: {
@@ -341,6 +336,17 @@ function readStorage<T>(key: string, fallback: T): T {
   }
 }
 
+const getInitialWorkspace = () => {
+  const savedConversations = readStorage<Conversation[]>(WORKSPACE_STORAGE.conversations, []);
+  const conversations = savedConversations.length ? savedConversations : [createConversation()];
+
+  return {
+    conversations,
+    activeConversationId: localStorage.getItem(WORKSPACE_STORAGE.activeConversation) || conversations[0].id,
+    displayName: localStorage.getItem(WORKSPACE_STORAGE.displayName) || "Developer",
+  };
+};
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -531,34 +537,25 @@ function EmptyState({
    ========================================================= */
 
 export default function App() {
+  const [initialWorkspace] = useState(getInitialWorkspace);
   const [activePage, setActivePage] = useState<PageId>("overview");
 
-  const [displayName, setDisplayName] = useState("Developer");
+  const [displayName, setDisplayName] = useState(() => initialWorkspace.displayName);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [toast, setToast] = useState("");
-  const [authReady, setAuthReady] = useState(false);
-  const [signedIn, setSignedIn] = useState(false);
-  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
-  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
-  const [authError, setAuthError] = useState("");
-  const [authMessage, setAuthMessage] = useState("");
-  const [authBusy, setAuthBusy] = useState(false);
 
-  const [conversations, setConversations] = useState<Conversation[]>(() => [
-    createConversation(),
-  ]);
+  const [conversations, setConversations] = useState<Conversation[]>(() => initialWorkspace.conversations);
 
-  const [activeConversationId, setActiveConversationId] = useState("");
+  const [activeConversationId, setActiveConversationId] = useState(() => initialWorkspace.activeConversationId);
 
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState("");
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
-  const authBootstrappedRef = useRef(false);
 
   const [backendStatus, setBackendStatus] = useState<
     "checking" | "online" | "offline"
@@ -637,102 +634,6 @@ export default function App() {
     window.setTimeout(() => setToast(""), 3200);
   }, []);
 
-  const loadUserWorkspace = useCallback((user: AuthUser, openDashboard: boolean) => {
-    if (!user.id) return;
-
-    const keys = storageKeysForUser(user.id);
-    const savedConversations = readStorage<Conversation[]>(keys.conversations, []);
-    const nextConversations = savedConversations.length ? savedConversations : [createConversation()];
-    const savedPage = localStorage.getItem(keys.activePage) as PageId | null;
-    const allowedPages: PageId[] = ["overview", "assistant", "code", "github", "integrations", "settings"];
-    const preferredName = user.user_metadata?.display_name || localStorage.getItem(keys.displayName) || user.email?.split("@")[0] || "Developer";
-
-    setConversations(nextConversations);
-    setActiveConversationId(localStorage.getItem(keys.activeConversation) || nextConversations[0].id);
-    setDisplayName(preferredName);
-    setActivePage(openDashboard || !allowedPages.includes(savedPage as PageId) ? "overview" : savedPage as PageId);
-  }, []);
-
-  useEffect(() => {
-    // Avoid sending confirmation or session-status requests twice when
-    // React Strict Mode re-runs effects during local development.
-    if (authBootstrappedRef.current) return;
-    authBootstrappedRef.current = true;
-
-    void (async () => {
-      // Supabase email-confirmation links return the temporary access token in
-      // the URL fragment. Exchange it before checking an existing session.
-      const confirmationParams = new URLSearchParams(window.location.hash.slice(1));
-      const accessToken = confirmationParams.get("access_token");
-
-      if (accessToken) {
-        window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
-        const result = await apiRequest<{ signed_in: boolean; user?: AuthUser }>("/api/auth/confirm", {
-          method: "POST",
-          body: JSON.stringify({ access_token: accessToken }),
-        });
-
-        if (result.ok && result.data?.signed_in) {
-          setAuthUser(result.data.user || null);
-          const profileName = result.data.user?.user_metadata?.display_name;
-          if (profileName) setDisplayName(profileName);
-          setSignedIn(true);
-          loadUserWorkspace(result.data.user || {}, true);
-          setAuthReady(true);
-          return;
-        }
-
-        setAuthError(result.error || "We could not finish verifying this email. Request a new verification link.");
-      }
-
-      // Restore a valid session after a normal browser refresh.
-      const result = await apiRequest<{ signed_in: boolean; user?: AuthUser }>("/api/auth/status");
-      if (result.ok && result.data?.signed_in) {
-        setAuthUser(result.data.user || null);
-        setSignedIn(true);
-        loadUserWorkspace(result.data.user || {}, false);
-      } else {
-        setSignedIn(false);
-      }
-      setAuthReady(true);
-    })();
-  }, [loadUserWorkspace]);
-
-  const submitAuth = async (event: FormEvent<HTMLFormElement>, action: "login" | "signup") => {
-    event.preventDefault();
-    setAuthBusy(true); setAuthError(""); setAuthMessage("");
-    const data = new FormData(event.currentTarget);
-    const result = await apiRequest<{ signed_in: boolean; message?: string; user?: AuthUser }>(`/api/auth/${action}`, {
-      method: "POST", body: JSON.stringify({
-        email: data.get("email"),
-        password: data.get("password"),
-        display_name: data.get("displayName"),
-      }),
-    });
-    setAuthBusy(false);
-    if (!result.ok) { setAuthError(result.error || "Authentication failed."); return; }
-    if (result.data?.signed_in) {
-      setAuthUser(result.data.user || null);
-      setSignedIn(true);
-      loadUserWorkspace(result.data.user || {}, true);
-    } else {
-      setAuthMessage(result.data?.message || "Check your email, then sign in.");
-      setAuthMode("login");
-    }
-  };
-
-  const logout = useCallback(async () => {
-    setAuthBusy(true);
-    await apiRequest("/api/auth/logout", { method: "POST" });
-    setAuthUser(null);
-    setSignedIn(false);
-    setActivePage("overview");
-    setDisplayName("Developer");
-    setConversations([createConversation()]);
-    setActiveConversationId("");
-    setAuthBusy(false);
-  }, []);
-
   const navigate = useCallback((page: PageId) => {
     setActivePage(page);
     setMobileSidebarOpen(false);
@@ -763,31 +664,19 @@ export default function App() {
 
   /* Persist workspace state. */
 
-  const currentUserStorage = authUser?.id ? storageKeysForUser(authUser.id) : null;
+  const workspaceStorage = WORKSPACE_STORAGE;
 
   useEffect(() => {
-    if (signedIn && currentUserStorage) {
-      localStorage.setItem(currentUserStorage.conversations, JSON.stringify(conversations));
-    }
-  }, [conversations, currentUserStorage, signedIn]);
+    localStorage.setItem(workspaceStorage.conversations, JSON.stringify(conversations));
+  }, [conversations, workspaceStorage]);
 
   useEffect(() => {
-    if (signedIn && currentUserStorage && activeConversationId) {
-      localStorage.setItem(currentUserStorage.activeConversation, activeConversationId);
-    }
-  }, [activeConversationId, currentUserStorage, signedIn]);
+    if (activeConversationId) localStorage.setItem(workspaceStorage.activeConversation, activeConversationId);
+  }, [activeConversationId, workspaceStorage]);
 
   useEffect(() => {
-    if (signedIn && currentUserStorage) {
-      localStorage.setItem(currentUserStorage.displayName, displayName);
-    }
-  }, [currentUserStorage, displayName, signedIn]);
-
-  useEffect(() => {
-    if (signedIn && currentUserStorage) {
-      localStorage.setItem(currentUserStorage.activePage, activePage);
-    }
-  }, [activePage, currentUserStorage, signedIn]);
+    localStorage.setItem(workspaceStorage.displayName, displayName);
+  }, [workspaceStorage, displayName]);
 
   useEffect(() => {
     if (
@@ -1390,7 +1279,7 @@ export default function App() {
             <>
               <span className="dp-profile-info">
                 <strong>{displayName}</strong>
-                <small>{authUser?.email || "Workspace account"}</small>
+                <small>Local workspace</small>
               </span>
               <span className="dp-profile-menu">···</span>
             </>
@@ -2397,21 +2286,6 @@ export default function App() {
           <div className="dp-settings-card dp-settings-danger">
             <div className="dp-settings-card-heading">
               <div>
-                <h2>Account</h2>
-                <p>{authUser?.email || "Signed in with Supabase email authentication."}</p>
-              </div>
-            </div>
-            <div className="dp-settings-card-footer">
-              <span>Your session stays active when you reload this website.</span>
-              <Button variant="danger" onClick={() => void logout()} disabled={authBusy}>
-                {authBusy ? "Signing out…" : "Log out"}
-              </Button>
-            </div>
-          </div>
-
-          <div className="dp-settings-card dp-settings-danger">
-            <div className="dp-settings-card-heading">
-              <div>
                 <h2>Local conversation data</h2>
                 <p>
                   Conversations are currently stored in this browser's
@@ -2472,24 +2346,6 @@ export default function App() {
   /* =======================================================
      Render
      ======================================================= */
-
-  if (!authReady) return <main className="dp-auth-page"><p>Loading workspace…</p></main>;
-
-  if (!signedIn) return (
-    <main className="dp-auth-page">
-      <section className="dp-auth-intro"><div className="dp-brand-mark"><span>✳</span></div><div className="dp-eyebrow">DEVPILOTAI · YOUR AI WORKSPACE</div><h1>Welcome<span>.</span></h1><p>Use a verified Supabase email to enter your workspace.</p></section>
-      <form className="dp-auth-card" onSubmit={(event) => void submitAuth(event, authMode)}>
-        <h2>{authMode === "login" ? "Sign in to DevPilotAI" : "Create your DevPilotAI account"}</h2>
-        <p>{authMode === "login" ? "Use your verified email and password to continue." : "We’ll send a verification link to your email address."}</p>
-        {authMode === "signup" && <label className="dp-form-field"><span>Display name</span><input name="displayName" type="text" required maxLength={60} autoComplete="name" /></label>}
-        <label className="dp-form-field"><span>Email</span><input name="email" type="email" required autoComplete="email" /></label>
-        <label className="dp-form-field"><span>Password</span><input name="password" type="password" required minLength={8} autoComplete={authMode === "login" ? "current-password" : "new-password"} /></label>
-        {authError && <p className="dp-chat-error">{authError}</p>}
-        {authMessage && <p className="dp-auth-message">{authMessage}</p>}
-        <div className="dp-auth-actions"><Button variant="primary" type="submit" disabled={authBusy}>{authBusy ? "Please wait…" : authMode === "login" ? "Sign in" : "Send verification email"}</Button><button type="button" className="dp-integration-info" onClick={() => { setAuthMode((mode) => mode === "login" ? "signup" : "login"); setAuthError(""); setAuthMessage(""); }}>{authMode === "login" ? "Create account" : "I already have an account"}</button></div>
-      </form>
-    </main>
-  );
 
   return (
     <div className="dp-app">

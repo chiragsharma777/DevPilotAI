@@ -1580,7 +1580,6 @@ async def google_logout(request: Request):
 )
 async def chat(
     request: ChatRequest,
-    _user: dict[str, Any] = Depends(get_current_user),
 ):
     """Generate a response using Sarvam AI."""
 
